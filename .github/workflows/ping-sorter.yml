@@ -1,0 +1,126 @@
+name: Сортировка конфигов по пингу
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+jobs:
+  sort-by-ping:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Создать папки
+        run: |
+          mkdir -p vpn-configs sorted-configs
+      
+      - name: Скрипт сортировки по пингу
+        run: |
+          cat > sort.py << 'EOF'
+          import os, glob, time, re, socket
+          from pathlib import Path
+          
+          CONFIGS_DIR = "vpn-configs"
+          OUTPUT_DIR = "sorted-configs"
+          
+          def get_server(file_path):
+              try:
+                  with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                      content = f.read().strip()
+                  if content.startswith('vless://'):
+                      import urllib.parse
+                      parsed = urllib.parse.urlparse(content)
+                      server = parsed.netloc.split('@')[1].split(':')[0]
+                      port = parsed.port or 443
+                      return server, port
+                  match = re.search(r'([a-zA-Z0-9.-]+):(\d+)', content)
+                  if match:
+                      return match.group(1), int(match.group(2))
+                  match = re.search(r'(\d+\.\d+\.\d+\.\d+|[a-zA-Z0-9.-]+\.[a-z]{2,})', content)
+                  if match:
+                      return match.group(1), 443
+              except:
+                  pass
+              return None, None
+          
+          def tcp_ping(host, port, timeout=3):
+              try:
+                  start = time.time()
+                  sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  sock.settimeout(timeout)
+                  sock.connect((host, port))
+                  elapsed = (time.time() - start) * 1000
+                  sock.close()
+                  return elapsed
+              except:
+                  return None
+          
+          configs = glob.glob(f"{CONFIGS_DIR}/*.txt")
+          if not configs:
+              print("Нет файлов в vpn-configs/")
+              exit(0)
+          
+          print(f"Найдено конфигов: {len(configs)}")
+          
+          results = []
+          for idx, path in enumerate(configs, 1):
+              name = os.path.basename(path)
+              print(f"[{idx}/{len(configs)}] Пингую: {name}")
+              server, port = get_server(path)
+              if not server:
+                  print(f"   Не удалось распарсить, пропускаю")
+                  continue
+              ping = tcp_ping(server, port)
+              if ping:
+                  print(f"   Пинг: {ping:.1f} мс")
+                  results.append((path, ping, name))
+              else:
+                  print(f"   НЕТ ОТВЕТА")
+              time.sleep(0.3)
+          
+          if not results:
+              print("Нет доступных серверов!")
+              exit(0)
+          
+          results.sort(key=lambda x: x[1])
+          
+          output = Path(OUTPUT_DIR)
+          if output.exists():
+              import shutil
+              shutil.rmtree(output)
+          output.mkdir()
+          
+          for i in range(0, len(results), 50):
+              start = i + 1
+              end = min(i + 50, len(results))
+              filename = f"{start}-{end}.txt"
+              with open(output / filename, 'w', encoding='utf-8') as f:
+                  f.write(f"# МЕСТА {start}-{end} (отсортировано по пингу)\n")
+                  f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                  for j, (path, ping, name) in enumerate(results[i:end], start):
+                      with open(path, 'r', encoding='utf-8', errors='ignore') as src:
+                          f.write(f"# ===== МЕСТО {j} | ПИНГ: {ping:.0f}мс | {name} =====\n")
+                          f.write(src.read())
+                          f.write("\n\n")
+          
+          print(f"\nГотово! Обработано {len(results)} конфигов")
+          print(f"Файлы сохранены в {OUTPUT_DIR}/")
+          EOF
+          
+          python3 sort.py
+      
+      - name: Сохранить результаты
+        run: |
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git add sorted-configs/
+          git diff --staged --quiet || git commit -m "Сортировка по пингу $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push
