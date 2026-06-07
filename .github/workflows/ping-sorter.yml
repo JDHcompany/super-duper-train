@@ -1,4 +1,4 @@
-name: Сортировка конфигов по пингу
+name: Сортировка конфигов по пингу и странам
 
 on:
   schedule:
@@ -22,34 +22,83 @@ jobs:
         run: |
           mkdir -p vpn-configs sorted-configs
       
-      - name: Скрипт сортировки по пингу
+      - name: Скрипт сортировки по пингу и странам
         run: |
           cat > sort.py << 'EOF'
-          import os, glob, time, re, socket
+          import os, glob, time, re, socket, shutil
           from pathlib import Path
+          from collections import defaultdict
           
           CONFIGS_DIR = "vpn-configs"
           OUTPUT_DIR = "sorted-configs"
+          MAX_PER_FILE = 300
+          GROUP_SIZE = 50
           
-          def get_server(file_path):
+          def get_country_and_server(file_path):
+              """Возвращает (страна, сервер, порт) из конфига"""
               try:
                   with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                       content = f.read().strip()
+                  
+                  # Парсим сервер
+                  server = None
+                  port = 443
+                  
                   if content.startswith('vless://'):
                       import urllib.parse
                       parsed = urllib.parse.urlparse(content)
                       server = parsed.netloc.split('@')[1].split(':')[0]
                       port = parsed.port or 443
-                      return server, port
-                  match = re.search(r'([a-zA-Z0-9.-]+):(\d+)', content)
-                  if match:
-                      return match.group(1), int(match.group(2))
-                  match = re.search(r'(\d+\.\d+\.\d+\.\d+|[a-zA-Z0-9.-]+\.[a-z]{2,})', content)
-                  if match:
-                      return match.group(1), 443
+                  else:
+                      match = re.search(r'([a-zA-Z0-9.-]+):(\d+)', content)
+                      if match:
+                          server, port = match.group(1), int(match.group(2))
+                      else:
+                          match = re.search(r'(\d+\.\d+\.\d+\.\d+|[a-zA-Z0-9.-]+\.[a-z]{2,})', content)
+                          if match:
+                              server = match.group(1)
+                  
+                  if not server:
+                      return "unknown", None, None
+                  
+                  # Определяем страну по домену или IP
+                  country = "unknown"
+                  
+                  # Список ключевых слов для стран
+                  country_keywords = {
+                      "usa": ["us-", ".us.", "united states", "new york", "los angeles", "miami", "chicago", "dallas", "seattle", "ashburn"],
+                      "germany": ["de-", ".de.", "germany", "frankfurt", "berlin"],
+                      "netherlands": ["nl-", ".nl.", "netherlands", "amsterdam"],
+                      "uk": ["uk-", ".uk.", "united kingdom", "london", "manchester"],
+                      "france": ["fr-", ".fr.", "france", "paris"],
+                      "canada": ["ca-", ".ca.", "canada", "toronto", "vancouver", "montreal"],
+                      "australia": ["au-", ".au.", "australia", "sydney", "melbourne"],
+                      "japan": ["jp-", ".jp.", "japan", "tokyo", "osaka"],
+                      "singapore": ["sg-", ".sg.", "singapore"],
+                      "russia": ["ru-", ".ru.", "russia", "moscow", "st petersburg"],
+                      "poland": ["pl-", ".pl.", "poland", "warsaw"],
+                      "sweden": ["se-", ".se.", "sweden", "stockholm"],
+                      "finland": ["fi-", ".fi.", "finland", "helsinki"],
+                      "spain": ["es-", ".es.", "spain", "madrid", "barcelona"],
+                      "italy": ["it-", ".it.", "italy", "milan", "rome"],
+                      "brazil": ["br-", ".br.", "brazil", "sao paulo"],
+                      "india": ["in-", ".in.", "india", "mumbai"],
+                      "south korea": ["kr-", ".kr.", "korea", "seoul"],
+                  }
+                  
+                  server_lower = server.lower()
+                  for country_name, keywords in country_keywords.items():
+                      for kw in keywords:
+                          if kw in server_lower:
+                              country = country_name
+                              break
+                      if country != "unknown":
+                          break
+                  
+                  return country, server, port
+                  
               except:
-                  pass
-              return None, None
+                  return "unknown", None, None
           
           def tcp_ping(host, port, timeout=3):
               try:
@@ -63,56 +112,120 @@ jobs:
               except:
                   return None
           
-          configs = glob.glob(f"{CONFIGS_DIR}/*.txt")
-          if not configs:
-              print("Нет файлов в vpn-configs/")
-              exit(0)
+          def main():
+              configs = glob.glob(f"{CONFIGS_DIR}/*.txt")
+              if not configs:
+                  print("Нет файлов в vpn-configs/")
+                  return
+              
+              print(f"Найдено конфигов: {len(configs)}")
+              
+              # Собираем результаты с пингом
+              results = []  # (путь, пинг, имя, страна)
+              for idx, path in enumerate(configs, 1):
+                  name = os.path.basename(path)
+                  country, server, port = get_country_and_server(path)
+                  print(f"[{idx}/{len(configs)}] Пингую: {name} ({country})")
+                  
+                  if not server:
+                      print(f"   Не удалось распарсить, пропускаю")
+                      continue
+                  
+                  ping = tcp_ping(server, port)
+                  if ping:
+                      print(f"   Пинг: {ping:.1f} мс → {country}")
+                      results.append((path, ping, name, country))
+                  else:
+                      print(f"   НЕТ ОТВЕТА")
+                  
+                  time.sleep(0.3)
+              
+              if not results:
+                  print("Нет доступных серверов!")
+                  return
+              
+              # Сортируем по пингу
+              results.sort(key=lambda x: x[1])
+              
+              # Группируем по странам
+              by_country = defaultdict(list)
+              for path, ping, name, country in results:
+                  by_country[country].append((path, ping, name))
+              
+              # Очищаем выходную папку
+              output_dir = Path(OUTPUT_DIR)
+              if output_dir.exists():
+                  shutil.rmtree(output_dir)
+              output_dir.mkdir()
+              
+              print("\n" + "="*60)
+              print("РАСКЛАДЫВАЮ ПО ПАПКАМ СТРАН И РЕЖУ НА ФАЙЛЫ")
+              print("="*60)
+              
+              for country, country_results in by_country.items():
+                  # Сортируем внутри страны по пингу
+                  country_results.sort(key=lambda x: x[1])
+                  
+                  # Создаём папку страны
+                  country_dir = output_dir / country
+                  country_dir.mkdir(exist_ok=True)
+                  
+                  print(f"\n📁 {country.upper()} — {len(country_results)} конфигов")
+                  
+                  # Режем на файлы по MAX_PER_FILE строк в каждом
+                  for file_num in range(0, len(country_results), MAX_PER_FILE):
+                      start_idx = file_num
+                      end_idx = min(file_num + MAX_PER_FILE, len(country_results))
+                      chunk = country_results[start_idx:end_idx]
+                      
+                      # Внутри этого куска режем по GROUP_SIZE мест
+                      for group_num in range(0, len(chunk), GROUP_SIZE):
+                          group_start = group_num + 1
+                          group_end = min(group_num + GROUP_SIZE, len(chunk))
+                          
+                          # Имя файла: places_1-50.txt, places_51-100.txt и т.д.
+                          if len(chunk) > GROUP_SIZE:
+                              filename = f"places_{group_start}-{group_end}.txt"
+                          else:
+                              filename = f"all_{group_start}-{group_end}.txt"
+                          
+                          output_path = country_dir / filename
+                          
+                          with open(output_path, 'w', encoding='utf-8') as f:
+                              f.write(f"# СТРАНА: {country.upper()}\n")
+                              f.write(f"# МЕСТА {group_start}-{group_end} (из {len(country_results)})\n")
+                              f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                              f.write("="*60 + "\n\n")
+                              
+                              for rank, (path, ping, name) in enumerate(chunk[group_num:group_end], group_start):
+                                  with open(path, 'r', encoding='utf-8', errors='ignore') as src:
+                                      f.write(f"# ===== МЕСТО {rank} | ПИНГ: {ping:.0f}мс | {name} =====\n")
+                                      f.write(src.read())
+                                      f.write("\n\n")
+                          
+                          print(f"   ✅ {filename} — {group_end-group_start+1} конфигов")
+              
+              # Общий отчёт
+              report_path = output_dir / "FULL_REPORT.txt"
+              with open(report_path, 'w', encoding='utf-8') as f:
+                  f.write("="*80 + "\n")
+                  f.write("ПОЛНЫЙ ОТЧЁТ ПО ПИНГУ\n")
+                  f.write("="*80 + "\n\n")
+                  f.write(f"Всего проверено: {len(results)} конфигов\n\n")
+                  
+                  for country, country_results in by_country.items():
+                      f.write(f"\n📍 {country.upper()}: {len(country_results)} конфигов\n")
+                      for rank, (path, ping, name) in enumerate(country_results, 1):
+                          f.write(f"   #{rank:3d} | {ping:5.1f}мс | {name}\n")
+              
+              print("\n" + "="*60)
+              print(f"✨ ГОТОВО!")
+              print(f"📁 Результаты в {OUTPUT_DIR}/")
+              print(f"📄 Отчёт: {report_path}")
+              print("="*60)
           
-          print(f"Найдено конфигов: {len(configs)}")
-          
-          results = []
-          for idx, path in enumerate(configs, 1):
-              name = os.path.basename(path)
-              print(f"[{idx}/{len(configs)}] Пингую: {name}")
-              server, port = get_server(path)
-              if not server:
-                  print(f"   Не удалось распарсить, пропускаю")
-                  continue
-              ping = tcp_ping(server, port)
-              if ping:
-                  print(f"   Пинг: {ping:.1f} мс")
-                  results.append((path, ping, name))
-              else:
-                  print(f"   НЕТ ОТВЕТА")
-              time.sleep(0.3)
-          
-          if not results:
-              print("Нет доступных серверов!")
-              exit(0)
-          
-          results.sort(key=lambda x: x[1])
-          
-          output = Path(OUTPUT_DIR)
-          if output.exists():
-              import shutil
-              shutil.rmtree(output)
-          output.mkdir()
-          
-          for i in range(0, len(results), 50):
-              start = i + 1
-              end = min(i + 50, len(results))
-              filename = f"{start}-{end}.txt"
-              with open(output / filename, 'w', encoding='utf-8') as f:
-                  f.write(f"# МЕСТА {start}-{end} (отсортировано по пингу)\n")
-                  f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                  for j, (path, ping, name) in enumerate(results[i:end], start):
-                      with open(path, 'r', encoding='utf-8', errors='ignore') as src:
-                          f.write(f"# ===== МЕСТО {j} | ПИНГ: {ping:.0f}мс | {name} =====\n")
-                          f.write(src.read())
-                          f.write("\n\n")
-          
-          print(f"\nГотово! Обработано {len(results)} конфигов")
-          print(f"Файлы сохранены в {OUTPUT_DIR}/")
+          if __name__ == "__main__":
+              main()
           EOF
           
           python3 sort.py
@@ -122,5 +235,5 @@ jobs:
           git config user.email "action@github.com"
           git config user.name "GitHub Action"
           git add sorted-configs/
-          git diff --staged --quiet || git commit -m "Сортировка по пингу $(date -u +%Y-%m-%dT%H:%MZ)"
+          git diff --staged --quiet || git commit -m "Сортировка по пингу и странам $(date -u +%Y-%m-%dT%H:%MZ)"
           git push
